@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "tsclient"
+version = "0.1.0"
+description = "TradeStation API client implementation"
+authors = ["Steve"]
+readme = "README.md"
+packages = [{ include = "tsclient", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.9.1,<4.0"
+requests = "^2.31.0"
+
+[tool.poetry.group.dev.dependencies]
+ts_py = { path = "C:/Users/steve/OneDrive/Trading/ts-py", develop = true }
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
