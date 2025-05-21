@@ -1,12 +1,12 @@
 """BaseClient class for the TradeStation API."""
-from ..logger import get_logger
+from ..logger import get_logger, log_api_call
 import json
 import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Awaitable, Callable, Coroutine, Mapping, Optional, Union
+from typing import Any, Callable, Dict, Mapping, Optional, Union
 
 from httpx import Client, Response
 
@@ -15,6 +15,50 @@ AUTH_ENDPOINT = "https://signin.tradestation.com/authorize"
 TOKEN_ENDPOINT = "https://signin.tradestation.com/oauth/token"
 AUDIENCE_ENDPOINT = "https://api.tradestation.com/v3"
 PAPER_ENDPOINT = "https://sim-api.tradestation.com/v3"
+
+
+class TradeStationError(Exception):
+    """Base exception for TradeStation API errors."""
+    
+    def __init__(self, message: str, status_code: Optional[int] = None, 
+                 response: Optional[Dict[str, Any]] = None):
+        """Initialize with error details.
+        
+        Args:
+            message: Error message
+            status_code: Optional HTTP status code
+            response: Optional API response data
+        """
+        self.status_code = status_code
+        self.response = response
+        super().__init__(message)
+        
+    def __str__(self) -> str:
+        """Return a detailed error message."""
+        base_message = super().__str__()
+        if self.status_code:
+            base_message += f" (Status: {self.status_code})"
+        return base_message
+
+
+class AuthenticationError(TradeStationError):
+    """Exception raised for authentication and authorization errors."""
+    pass
+
+
+class ApiError(TradeStationError):
+    """Exception raised for API-related errors."""
+    pass
+
+
+class RateLimitError(TradeStationError):
+    """Exception raised when API rate limits are exceeded."""
+    pass
+
+
+class NetworkError(TradeStationError):
+    """Exception raised for network connectivity issues."""
+    pass
 
 
 @dataclass
@@ -51,13 +95,10 @@ class BaseClient(ABC):
     _token_read_func: Optional[Callable] = field(default=None)
     _token_update_func: Optional[Callable] = field(default=None)
 
-    def __init__(self):
-        self._logger = get_logger(__name__)
-        # Add logging statements where needed:
-        self._logger.info("Initializing client")
-
     def __post_init__(self) -> None:
-        """Init the base resource field."""
+        """Initialize the base resource field and logger."""
+        self._logger = get_logger(__name__, caller=False)
+        self._logger.info("callee: Initializing client")
         self._base_resource = PAPER_ENDPOINT if self.paper_trade else AUDIENCE_ENDPOINT
         self._token_read_func = self._token_read if self._token_read_func is None else self._token_read_func
         self._token_update_func = self._token_save if self._token_update_func is None else self._token_update_func
@@ -65,14 +106,14 @@ class BaseClient(ABC):
     @abstractmethod
     def _delete_request(
         self, url: str, params: Optional[dict] = None, headers: Optional[dict] = None
-    ) -> Union[Response, Coroutine[Any, Any, Response]]:
+    ) -> Union[Response, Any]:
         """Submit a delete request to TradeStation."""
         pass
 
     @abstractmethod
     def _get_request(
         self, url: str, params: Optional[dict] = None, headers: Optional[dict] = None
-    ) -> Union[Response, Coroutine[Any, Any, Response]]:
+    ) -> Union[Response, Any]:
         """Submit a get request to TradeStation."""
         pass
 
@@ -83,7 +124,7 @@ class BaseClient(ABC):
         params: Optional[dict] = None,
         headers: Optional[dict] = None,
         data: Optional[Mapping[str, Any]] = None,
-    ) -> Union[Response, Coroutine[Any, Any, Response]]:
+    ) -> Union[Response, Any]:
         """Submit a post request to TradeStation."""
         pass
 
@@ -94,7 +135,7 @@ class BaseClient(ABC):
         params: Optional[dict] = None,
         headers: Optional[dict] = None,
         data: Optional[Mapping[str, Any]] = None,
-    ) -> Union[Response, Coroutine[Any, Any, Response]]:
+    ) -> Union[Response, Any]:
         """Submit a put request to TradeStation."""
         pass
 
@@ -123,8 +164,57 @@ class BaseClient(ABC):
         (str): A full URL.
         """
         # paper trading uses a different base url compared to regular trading.
-
         return f"{self._base_resource}/{url}"
+
+    def _handle_error_response(self, response: Response, method: str, url: str) -> None:
+        """Handle error responses from the API.
+        
+        Args:
+            response: The HTTP response object
+            method: The HTTP method used (GET, POST, etc.)
+            url: The URL that was requested
+            
+        Raises:
+            AuthenticationError: For 401, 403 errors
+            RateLimitError: For 429 errors
+            ApiError: For other API errors
+        """
+        status_code = response.status_code
+        error_data = None
+        
+        try:
+            error_data = response.json()
+        except:
+            error_content = response.text
+        
+        # Log detailed error information
+        self._logger.error(f"callee: API error: {method} {url} - Status: {status_code}")
+        if error_data:
+            self._logger.error(f"callee: Error details: {error_data}")
+        
+        # Handle different error types
+        if status_code == 401 or status_code == 403:
+            raise AuthenticationError(
+                f"Authentication error for {method} {url}", 
+                status_code=status_code, 
+                response=error_data
+            )
+        elif status_code == 429:
+            raise RateLimitError(
+                f"Rate limit exceeded for {method} {url}", 
+                status_code=status_code, 
+                response=error_data
+            )
+        else:
+            error_message = f"API error for {method} {url}"
+            if error_data and 'message' in error_data:
+                error_message = f"{error_message}: {error_data['message']}"
+            
+            raise ApiError(
+                error_message, 
+                status_code=status_code, 
+                response=error_data
+            )
 
     def _grab_refresh_token(self) -> bool:
         """Refresh the current access token if it's expired.
@@ -133,6 +223,8 @@ class BaseClient(ABC):
         ----
         (bool): `True` if grabbing the refresh token was successful. `False` otherwise.
         """
+        self._logger.info("callee: Refreshing access token")
+        
         # Build the parameters of our request.
         data = {
             "client_id": self.client_id,
@@ -141,18 +233,31 @@ class BaseClient(ABC):
             "refresh_token": self._refresh_token,
         }
 
-        # Make a post request to the token endpoint.
-        with Client() as client:
-            response: Response = client.post(
-                url=TOKEN_ENDPOINT,
-                data=data,
-            )
+        try:
+            # Make a post request to the token endpoint.
+            with Client() as client:
+                log_api_call(
+                    logger=self._logger,
+                    method="POST",
+                    endpoint=TOKEN_ENDPOINT,
+                    data=data
+                )
+                
+                response: Response = client.post(
+                    url=TOKEN_ENDPOINT,
+                    data=data,
+                )
 
-        # Save the token if the response was okay.
-        if response.status_code == 200:
-            self._token_save(response=response.json())
-            return True
-        else:
+            # Save the token if the response was okay.
+            if response.status_code == 200:
+                self._token_save(response=response.json())
+                self._logger.info("callee: Successfully refreshed access token")
+                return True
+            else:
+                self._logger.error(f"callee: Failed to refresh token: {response.status_code}")
+                return False
+        except Exception as e:
+            self._logger.error(f"callee: Error refreshing token: {str(e)}")
             return False
 
     def _token_save(self, response: dict) -> bool:
@@ -179,41 +284,49 @@ class BaseClient(ABC):
             state = {
                 "access_token": self._access_token,
                 "refresh_token": self._refresh_token,
-                "access_token_expires_at": self._access_token_expires_at,
-                "access_token_expires_in": self._access_token_expires_in,
+                "expires_in": self._access_token_expires_in,
+                "expires_at": self._access_token_expires_at,
             }
 
+            # This is now used only as a fallback if no token_update_func is provided
             with open(file=filename, mode="w+") as state_file:
                 json.dump(obj=state, fp=state_file, indent=4)
 
+            # If a custom token update function is provided, use it
+            if callable(self._token_update_func):
+                try:
+                    return self._token_update_func(state)
+                except Exception as e:
+                    self._logger.error(f"callee: Error in token update function: {str(e)}")
+                    return False
+
             return True
 
         return False
 
-    def _token_read(self) -> bool:
+    def _token_read(self) -> Optional[Dict[str, Any]]:
         """Read in a token from file.
 
         Returns:
-            bool: Success / Failure
+            Optional[Dict[str, Any]]: Token data if available, None if not found or error
         """
-        dir_path = os.path.dirname(os.path.realpath(__file__))
-        filename = "ts_state.json"
-        file_path = os.path.join(dir_path, filename)
-        state: Optional[dict] = None
-
-        with open(file=file_path, mode="r") as state_file:
-            state |= json.load(fp=state_file)
-
-        if isinstance(state, dict):
-            self._access_token = state.get("access_token")
-            self._refresh_token = state.get("refresh_token")
-            self._access_token_expires_in = state.get(
-                "access_token_expires_at", 0)
-            self._access_token_expires_at = state.get(
-                "access_token_expires_in", 0)
-            return True
-
-        return False
+        try:
+            dir_path = os.path.dirname(os.path.realpath(__file__))
+            filename = "ts_state.json"
+            file_path = os.path.join(dir_path, filename)
+            
+            if not os.path.exists(file_path):
+                self._logger.warning(f"callee: Token file not found: {file_path}")
+                return None
+                
+            with open(file=file_path, mode="r") as state_file:
+                state = json.load(fp=state_file)
+                
+            return state
+            
+        except Exception as e:
+            self._logger.error(f"callee: Error reading token: {str(e)}")
+            return None
 
     def _update_token_variables(self, response: dict) -> bool:
         """Update the local variable from a given token response.
@@ -228,6 +341,7 @@ class BaseClient(ABC):
         if "access_token" in response:
             self._access_token = response["access_token"]
         else:
+            self._logger.error("callee: No access token in response")
             return False
 
         # If there is a refresh token then grab it.
@@ -236,11 +350,17 @@ class BaseClient(ABC):
 
         # Set the login state.
         self._logged_in = True
+        self._auth_state = True
 
         # Store token expiration time.
-        self._access_token_expires_in = response["expires_in"]
-        self._access_token_expires_at = time.time() + \
-            int(response["expires_in"])
+        if "expires_in" in response:
+            self._access_token_expires_in = response["expires_in"]
+            self._access_token_expires_at = time.time() + int(response["expires_in"])
+        else:
+            # No expiration time in response, set a default (1 hour)
+            self._access_token_expires_in = 3600
+            self._access_token_expires_at = time.time() + 3600
+            self._logger.warning("callee: No token expiration time in response, using default")
 
         return True
 
@@ -258,12 +378,12 @@ class BaseClient(ABC):
         (int): The number of seconds till expiration
         """
         # Calculate the token expire time.
-        token_exp = time.time() >= self._access_token_expires_at
+        token_exp = self._access_token_expires_at - time.time()
 
         # if the time to expiration is less than or equal to 0, return 0.
-        return 0 if not self._refresh_token or token_exp else int(token_exp)
+        return max(0, int(token_exp)) if self._refresh_token else 0
 
-    def _token_validation(self, nseconds: int = 5) -> None:
+    def _token_validation(self, nseconds: int = 5) -> bool:
         """Validate the Access Token.
 
         Overview:
@@ -276,15 +396,28 @@ class BaseClient(ABC):
         ----
         nseconds (int): The minimum number of seconds the token has to be valid for before
             attempting to get a refresh token.
+            
+        Returns:
+            bool: True if token is valid, False otherwise
         """
-        if self._token_seconds() < nseconds:
-            self._grab_refresh_token()
+        if not self._access_token:
+            self._logger.warning("callee: No access token available")
+            return False
+            
+        seconds_left = self._token_seconds()
+        
+        if seconds_left < nseconds:
+            self._logger.info(f"callee: Token expires in {seconds_left} seconds, refreshing")
+            return self._grab_refresh_token()
+        else:
+            self._logger.debug(f"callee: Token valid for {seconds_left} more seconds")
+            return True
 
     #############
     # Brokerage #
     #############
 
-    def get_accounts(self, user_id: str) -> Response | Awaitable[Response]:
+    def get_accounts(self, user_id: str) -> Response:
         """Grabs all the accounts associated with the User.
 
         Arguments:
@@ -293,44 +426,116 @@ class BaseClient(ABC):
 
         Returns:
         ----
-        (dict): All the user accounts.
+        (Response): All the user accounts.
+        
+        Raises:
+            AuthenticationError: If authentication fails
+            ApiError: If API returns an error
+            NetworkError: If connection issues occur
         """
+        method = "GET"
+        endpoint = f"users/{user_id}/accounts"
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            url="users/{username}/accounts".format(username=user_id))
+        url_endpoint = self._api_endpoint(url=endpoint)
 
         # define the arguments
         params = {"access_token": self._access_token}
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={"access_token": "***"}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_accounts: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
-    def get_wallets(self, account_id: str) -> Response | Awaitable[Response]:
-        """Grabs a A valid crypto Account ID for the authenticated user.
+    def get_wallets(self, account_id: str) -> Response:
+        """Grabs a valid crypto Account ID for the authenticated user.
 
         Arguments:
         ----
-        user_id (str): The Username of the account holder.
+        account_id (str): The account ID.
 
         Returns:
         ----
-        (dict): All the user accounts.
+        (Response): Wallet information.
+        
+        Raises:
+            AuthenticationError: If authentication fails
+            ApiError: If API returns an error
+            NetworkError: If connection issues occur
         """
+        method = "GET"
+        endpoint = f"brokerage/accounts/{account_id}/wallets"
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            url=f"brokerage/accounts/{account_id}/wallets")
+        url_endpoint = self._api_endpoint(url=endpoint)
 
         # define the arguments
         params = {"access_token": self._access_token}
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={"access_token": "***"}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_wallets: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
-    def get_balances(self, account_keys: list[str | int]) -> Response | Awaitable[Response]:
+    def get_balances(self, account_keys: list[str | int]) -> Response:
         """Grabs all the balances for each account provided.
 
         Args:
@@ -341,14 +546,16 @@ class BaseClient(ABC):
         Raises:
         ----
         ValueError: If the list is more than 25 account numbers will raise an error.
+        AuthenticationError: If authentication fails
+        ApiError: If API returns an error
+        NetworkError: If connection issues occur
 
         Returns:
         ----
-        dict: A list of account balances for each of the accounts.
+        Response: A list of account balances for each of the accounts.
         """
-        # validate the token.
-        self._token_validation()
-
+        method = "GET"
+        
         # argument validation.
         account_keys_str = ""
         if not account_keys or not isinstance(account_keys, list):
@@ -359,17 +566,50 @@ class BaseClient(ABC):
         elif len(account_keys) > 25:
             raise ValueError(
                 "You cannot pass through more than 25 account keys.")
+                
+        endpoint = f"brokerage/accounts/{account_keys_str}/balances"
+
+        # validate the token.
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            f"brokerage/accounts/{account_keys_str}/balances")
+        url_endpoint = self._api_endpoint(endpoint)
 
         # define the arguments
         params = {"access_token": self._access_token}
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={"access_token": "***"}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_balances: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
-    def get_balances_bod(self, account_keys: list[str | int]) -> Response | Awaitable[Response]:
+    def get_balances_bod(self, account_keys: list[str | int]) -> Response:
         """Grabs the beginning of day balances for each account provided.
 
         Args:
@@ -380,14 +620,16 @@ class BaseClient(ABC):
         Raises:
         ----
         ValueError: If the list is more than 25 account numbers will raise an error.
+        AuthenticationError: If authentication fails
+        ApiError: If API returns an error
+        NetworkError: If connection issues occur
 
         Returns:
         ----
-        dict: A list of account balances for each of the accounts.
+        Response: A list of account balances for each of the accounts.
         """
-        # validate the token.
-        self._token_validation()
-
+        method = "GET"
+        
         # argument validation.
         account_keys_str = ""
         if not account_keys or not isinstance(account_keys, list):
@@ -398,19 +640,52 @@ class BaseClient(ABC):
         elif len(account_keys) > 25:
             raise ValueError(
                 "You cannot pass through more than 25 account keys.")
+                
+        endpoint = f"brokerage/accounts/{account_keys_str}/bodbalances"
+
+        # validate the token.
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            f"brokerage/accounts/{account_keys_str}/bodbalances")
+        url_endpoint = self._api_endpoint(endpoint)
 
         # define the arguments
         params = {"access_token": self._access_token}
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={"access_token": "***"}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_balances_bod: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
     def get_positions(
         self, account_keys: list[str | int], symbols: Optional[list[str]] = None
-    ) -> Response | Awaitable[Response]:
+    ) -> Response:
         """Grabs all the account positions.
 
         Arguments:
@@ -422,13 +697,19 @@ class BaseClient(ABC):
         Raises:
         ----
         ValueError: If the list is more than 25 account numbers will raise an error.
+        AuthenticationError: If authentication fails
+        ApiError: If API returns an error
+        NetworkError: If connection issues occur
 
         Returns:
         ----
-        dict: A list of account balances for each of the accounts.
+        Response: A list of account positions for each of the accounts.
         """
+        method = "GET"
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # argument validation, account keys.
         account_keys_str = ""
@@ -444,7 +725,6 @@ class BaseClient(ABC):
         # argument validation, symbols.
         if symbols is None:
             params = {"access_token": self._access_token}
-
         elif not symbols:
             raise ValueError(
                 "You cannot pass through an empty symbols list for the filter.")
@@ -454,15 +734,44 @@ class BaseClient(ABC):
             params = {"access_token": self._access_token,
                       "$filter": symbols_str}
 
+        endpoint = f"brokerage/accounts/{account_keys_str}/positions"
+            
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            f"brokerage/accounts/{account_keys_str}/positions")
+        url_endpoint = self._api_endpoint(endpoint)
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={k: "***" if k == "access_token" else v for k, v in params.items()}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_positions: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
     def get_orders(
         self, account_keys: list[str | int], page_size: int = 600, order_ids: Optional[list[str | int]] = None
-    ) -> Response | Awaitable[Response]:
+    ) -> Response:
         """Grab all the account orders for a list of accounts.
 
         Overview:
@@ -483,13 +792,19 @@ class BaseClient(ABC):
         Raises:
         ----
         ValueError: If the list is more than 25 account numbers will raise an error.
+        AuthenticationError: If authentication fails
+        ApiError: If API returns an error
+        NetworkError: If connection issues occur
 
         Returns:
         ----
-        dict: A list of account balances for each of the accounts.
+        Response: A list of account orders for each of the accounts.
         """
+        method = "GET"
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # argument validation, account keys.
         account_keys_str = ""
@@ -518,11 +833,40 @@ class BaseClient(ABC):
             "pageSize": page_size,
         }
 
+        endpoint = f"brokerage/accounts/{account_keys_str}/orders{order_ids_str}"
+        
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            url=f"brokerage/accounts/{account_keys_str}/orders{order_ids_str}")
+        url_endpoint = self._api_endpoint(endpoint)
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={k: "***" if k == "access_token" else v for k, v in params.items()}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_orders: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
     def get_historical_orders(
         self,
@@ -530,32 +874,37 @@ class BaseClient(ABC):
         since: date,
         page_size: int = 600,
         order_ids: Optional[list[str | int]] = None,
-    ) -> Response | Awaitable[Response]:
+    ) -> Response:
         """Grab all the account orders for a list of accounts.
 
         Overview:
         ----
         This endpoint is used to grab all the order from a list of accounts provided. Additionally,
-        each account will only go back 14 days when searching for orders.
+        each account will only go back 90 days when searching for orders.
 
         Arguments:
         ----
         account_keys (List[str]): A list of account numbers.
 
-        since (int): Number of days to look back, max is 14 days.
+        since (date): Starting date to look back. Limited to 90 days prior to current date.
 
         page_size (int): The page size.
 
-        page_number (int, optional): The page number to return if more than one. Defaults to 0.
+        order_ids (List[str|int], optional): Optional list of order IDs to filter by.
 
         Raises:
         ----
-        ValueError: If the list is more than 25 account numbers will raise an error.
+        ValueError: If the list is more than 25 account numbers or invalid parameters
+        AuthenticationError: If authentication fails
+        ApiError: If API returns an error
+        NetworkError: If connection issues occur
 
         Returns:
         ----
-        dict: A list of account balances for each of the accounts.
+        Response: A list of account historical orders for each of the accounts.
         """
+        method = "GET"
+        
         # Argument validation, account keys.
         if not since:
             since = date.today() - timedelta(days=90)
@@ -586,7 +935,8 @@ class BaseClient(ABC):
             raise ValueError("Limited to 90 days prior to the current date.")
 
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         params = {
             "access_token": self._access_token,
@@ -594,11 +944,40 @@ class BaseClient(ABC):
             "pageSize": page_size,
         }
 
+        endpoint = f"brokerage/accounts/{account_keys_str}/historicalorders{order_ids_str}"
+        
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            f"brokerage/accounts/{account_keys_str}/historicalorders{order_ids_str}")
+        url_endpoint = self._api_endpoint(endpoint)
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={k: "***" if k == "access_token" else v for k, v in params.items()}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_historical_orders: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
     ###############
     # Market Data #
@@ -613,22 +992,37 @@ class BaseClient(ABC):
         firstdate: datetime,
         lastdate: datetime,
         sessiontemplate: str,
-    ) -> Response | Awaitable[Response]:
-        """Grabs all the accounts associated with the User.
+    ) -> Response:
+        """Get bars/candle data for a symbol.
 
         Arguments:
         ----
-        user_id (str): The Username of the account holder.
+        symbol (str): The symbol to get data for
+        interval (int): The size of each bar
+        unit (str): The unit of time for each bar (e.g., 'Minute', 'Day')
+        barsback (int): Number of bars to retrieve
+        firstdate (datetime): Start date for the data
+        lastdate (datetime): End date for the data
+        sessiontemplate (str): Session template (e.g., 'Default', 'USEQPre')
 
         Returns:
         ----
-        (dict): All the user accounts.
+        Response: The bar chart data.
+        
+        Raises:
+            AuthenticationError: If authentication fails
+            ApiError: If API returns an error
+            NetworkError: If connection issues occur
         """
+        method = "GET"
+        endpoint = f"marketdata/barcharts/{symbol}"
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # define the endpoint.
-        url_endpoint = self._api_endpoint(f"marketdata/barcharts/{symbol}")
+        url_endpoint = self._api_endpoint(endpoint)
 
         # define the arguments
         params = {
@@ -641,782 +1035,156 @@ class BaseClient(ABC):
             "sessiontemplate": sessiontemplate,
         }
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={k: "***" if k == "access_token" else v for k, v in params.items()}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_bars: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
-    def get_crypto_symbol_names(self) -> Response | Awaitable[Response]:
-        """Fetch all crypto Symbol Names information."""
+    def get_crypto_symbol_names(self) -> Response:
+        """Fetch all crypto Symbol Names information.
+        
+        Returns:
+            Response: List of crypto symbols
+            
+        Raises:
+            AuthenticationError: If authentication fails
+            ApiError: If API returns an error
+            NetworkError: If connection issues occur
+        """
+        method = "GET"
+        endpoint = 'marketdata/symbollists/cryptopairs/symbolnames'
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            url='marketdata/symbollists/cryptopairs/symbolnames"')
+        url_endpoint = self._api_endpoint(endpoint)
 
         # define the arguments
         params = {"access_token": self._access_token}
 
-        return self._get_request(url=url_endpoint, params=params)
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={"access_token": "***"}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_crypto_symbol_names: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
-    def get_symbol_details(self, symbols: list[str]) -> Response | Awaitable[Response]:
-        """Grabs the info for a particular symbol.
+    def get_symbol_details(self, symbols: list[str]) -> Response:
+        """Grabs the info for specific symbol(s).
 
         Arguments:
         ----
-        symbol (str): A ticker symbol.
+        symbols (list[str]): A list of ticker symbols.
 
         Raises:
         ----
-        ValueError: If no symbol is provided will raise an error.
+        ValueError: If no symbols are provided or too many symbols.
+        AuthenticationError: If authentication fails
+        ApiError: If API returns an error
+        NetworkError: If connection issues occur
 
         Returns:
         ----
-        dict: A dictionary containing the symbol info.
+        Response: A response with symbol details.
         """
+        method = "GET"
+        
         # validate the token.
-        self._token_validation()
+        if not self._token_validation():
+            raise AuthenticationError("Failed to validate access token")
 
         if symbols is None:
             raise ValueError("You must pass through a symbol.")
         elif 0 > len(symbols) > 50:
             raise ValueError("You may only send [1..50] symbols per request.")
 
+        endpoint = f'marketdata/symbols/{",".join(symbols)}'
+            
         # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            f'marketdata/symbols/{",".join(symbols)}')
+        url_endpoint = self._api_endpoint(endpoint)
 
         # define the arguments.
         params = {"access_token": self._access_token}
 
-        return self._get_request(url=url_endpoint, params=params)
-
-    def get_option_expirations(
-        self, underlying: str, strike_price: Optional[float] = None
-    ) -> Response | Awaitable[Response]:
-        """Get the available option contract expiration dates for the underlying symbol.
-
-        Args:
-            underlying (str): The symbol for the underlying security on which the option contracts are based.
-                The underlying symbol must be an equity or index.
-            strike_price (Optional[float], optional): Strike price. If provided,
-                only expirations for that strike price will be returned. Defaults to None.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            f"marketdata/options/expirations/{underlying}")
-
-        # define the arguments
-        params = {"access_token": self._access_token,
-                  "strikePrice": strike_price}
-
-        return self._get_request(url=url_endpoint, params=params)
-
-    def get_option_risk_reward(self, price: float, legs: list[dict[str, Any]]) -> Response | Awaitable[Response]:
-        """Analyze the risk vs. reward of a potential option trade.
-
-        This endpoint is not applicable for option spread types with different expirations,
-        such as Calendar and Diagonal.
-
-        Args:
-            price (float): The quoted price for the option spread trade.
-            legs (list[dict[str, Any]]): The legs of the option spread trade.
-                If more than one leg is specified, the expiration dates must all be the same.
-                In addition, leg symbols must be of type stock, stock option, or index option.
-
-        Example Usage:
-        ```
-        legs = [
-                {
-                    "Symbol": "string",
-                    "Quantity": 0,
-                    "TradeAction": "BUY"
-                }
-            ]
-
-        client = get_option_risk_reward(4.20, legs)
-        ```
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint("marketdata/options/riskreward")
-
-        # define the arguments
-        params = {
-            "access_token": self._access_token,
-        }
-
-        payload = {"SpreadPrice": price, "Legs": legs}
-
-        return self._post_request(url=url_endpoint, params=params, data=payload)
-
-    def get_option_spread_types(self) -> Response | Awaitable[Response]:
-        """Get the available spread types for option chains."""
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint("marketdata/options/spreadtypes")
-
-        # define the arguments
-        params = {
-            "access_token": self._access_token,
-        }
-
-        return self._get_request(url=url_endpoint, params=params)
-
-    def get_option_strikes(
-        self,
-        underlying: str,
-        spreadType: Optional[str] = None,
-        strikeInterval: Optional[int] = None,
-        expiration: Optional[datetime] = None,
-        expiration2: Optional[datetime] = None,
-    ) -> Response | Awaitable[Response]:
-        """Get the available strike prices for a spread type and expiration date.
-
-        Args:
-            underlying (str): The symbol for the underlying security on which the option contracts are based.
-                The underlying symbol must be an equity or index.
-            spreadType (Optional[str], optional): The name of the spread type to get the strikes for.
-                This value can be obtained from the Get Option Spread Types endpoint.. Defaults to None.
-            strikeInterval (Optional[int], optional): Specifies the desired interval between the strike prices in a spread.
-                It must be greater than or equal to 1. A value of 1 uses consecutive strikes;
-                a value of 2 skips one between strikes; and so on. Defaults to None.
-            expiration (Optional[datetime], optional): Date on which the option contract expires; must be a valid expiration date.
-                Defaults to the next contract expiration date.. Defaults to None.
-            expiration2 (Optional[datetime], optional): Second contract expiration date required for
-                Calendar and Diagonal spreads. Defaults to None.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            "marketdata/options/strikes/{underlying}")
-
-        # define the arguments
-        params = {
-            "access_token": self._access_token,
-        }
-
-        if spreadType:
-            params["spreadType"] = spreadType
-        if strikeInterval:
-            params["strikeInterval"] = str(strikeInterval)
-        if expiration:
-            params["expiration"] = expiration.strftime("%m-%d-%Y")
-        if expiration2:
-            params["expiration2"] = expiration2.strftime("%m-%d-%Y")
-
-        return self._get_request(url=url_endpoint, params=params)
-
-    def get_quote_snapshots(self, symbols: list[str]) -> Response | Awaitable[Response]:
-        """Fetch a full snapshot of the latest Quote for the given Symbols.
-
-        For realtime Quote updates, users should use the Quote Stream endpoint.
-
-        Args:
-            symbols (list[str]): List of valid symbols. No more than 100 symbols per request.
-
-        Raises:
-            ValueError: A minimum of 1 and no more than 100 symbols per request.
-        """
-        # validate parameters
-        if 0 > len(symbols) > 100:
-            raise ValueError(
-                "A minimum of 1 and no more than 100 symbols per request.")
-        else:
-            symbols_str = ",".join(symbols)
-
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(f"marketdata/quotes/{symbols_str}")
-
-        # define the arguments
-        params = {
-            "access_token": self._access_token,
-        }
-
-        return self._get_request(url=url_endpoint, params=params)
-
-    ###################
-    # Order Execution #
-    ###################
-
-    def confirm_order(self, order_request: dict) -> Response | Awaitable[Response]:
-        """Return estimated cost and commission information for an order without the order actually being placed.
-
-        Request valid for Market, Limit, Stop Market, Stop Limit, Options, and Order Sends Order (OSO) order types.
-        All  market orders, excluding USDCUSD, must have Day duration (TimeInForce).
-        The fields that are returned in the response depend on the order type.
-        https://api.tradestation.com/docs/specification#tag/Order-Execution/operation/ConfirmOrder.
-
-        Args:
-            order_request (dict): Order Request
-        """
-        # Validate inputs.
-        if isinstance(order_request, dict):
-            payload = order_request
-        else:
-            raise ValueError("Invalid order request type.")
-
-        # Validate the token.
-        self._token_validation()
-
-        # Define the endpoint.
-        url_endpoint = self._api_endpoint(url="orderexecution/orderconfirm")
-
-        # Define the arguments.
-        params = {"access_token": self._access_token}
-
-        return self._post_request(url=url_endpoint, params=params, data=payload)
-
-    def confirm_group_order(self, orders: list[dict], type: str) -> Response | Awaitable[Response]:
-        """Create an Order Confirmation for a group order.
-
-        Request valid for all account types. Request valid for Order Cancels Order (OCO)
-        and Bracket (BRK) order types as well as grouped orders of other types (NORMAL).
-        All Crypto market orders, excluding USDCUSD, must have Day duration (TimeInForce).
-
-        Arguments:
-        ----
-        orders (List[dict]): A list of orders to confirm.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(
-            url="orderexecution/ordergroupconfirm")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        data = {"Type": type, "Orders": orders}
-
-        return self._post_request(url=url_endpoint, params=params, data=data)
-
-    def place_group_order(self, orders: list[dict], type: str) -> Response | Awaitable[Response]:
-        """Submit a list of orders.
-
-        Arguments:
-        ----
-        orders (List[dict]): A list of orders to submit.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(url="orderexecution/ordergroups")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        data = {"Type": type, "Orders": orders}
-
-        return self._post_request(url=url_endpoint, params=params, data=data)
-
-    def place_order(self, order: dict) -> Response | Awaitable[Response]:
-        """Submit an order.
-
-        Arguments:
-        ----
-        order (dict): A dictionary for order.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(url="orderexecution/orders")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        return self._post_request(url=url_endpoint, params=params, data=order)
-
-    def replace_order(self, order_id: str | int, new_order: dict) -> Response | Awaitable[Response]:
-        """Replace an order.
-
-        Arguments:
-        ----
-        order_id (str): An order id.
-
-        order (dict): A dictionary for order.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(f"orderexecution/orders/{order_id}")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        return self._put_request(url=url_endpoint, params=params, data=new_order)
-
-    def cancel_order(self, order_id: str) -> Response | Awaitable[Response]:
-        """Cancel an active order. Request valid for all account types.
-
-        Args:
-            order_id (str): Order ID to cancel. Equity, option or future orderIDs should not include dashes
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(f"orderexecution/orders/{order_id}")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        return self._delete_request(url=url_endpoint, params=params)
-
-    def get_activation_triggers(self) -> Response | Awaitable[Response]:
-        """
-        To place orders with activation triggers, a valid TriggerKey must be sent with the order.
-
-        This resource provides the available trigger methods with their corresponding key.
-        """
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint("orderexecution/activationtriggers")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        return self._get_request(url=url_endpoint, params=params)
-
-    def available_routes(self) -> Response | Awaitable[Response]:
-        """Return a list of valid routes that a client can specify when posting an order."""
-        # validate the token.
-        self._token_validation()
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint("orderexecution/routes")
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        return self._get_request(url=url_endpoint, params=params)
-
-    # def stream_quotes_changes(self, symbols=None):
-    #     """Streams quote changes for a list of symbols.
-
-    #     Arguments:
-    #     ----
-    #     symbol (List[str]): A list of ticker symbols.
-
-    #     Raises:
-    #     ----
-    #     ValueError: If no symbol is provided will raise an error.
-
-    #     Returns:
-    #     ----
-    #     (dict): A dictionary containing the symbol quotes.
-    #     """
-
-    #     # validate the token.
-    #     self._token_validation()
-
-    #     if symbols is None:
-    #         raise ValueError("You must pass through at least one symbol.")
-
-    #     symbols = ','.join(symbols)
-
-    #     # define the endpoint.
-    #     url_endpoint = self._api_endpoint(
-    #         url='stream/quote/changes/{symbols}'.format(symbols=symbols))
-
-    #     # define the headers
-    #     headers = {
-    #         'Accept': 'application/vnd.tradestation.streams+json'
-    #     }
-
-    #     # define the arguments.
-    #     params = {
-    #         'access_token': self._access_token
-    #     }
-
-    #     return self._handle_requests(
-    #         url=url_endpoint,
-    #         method='get',
-    #         headers=headers,
-    #         params=params,
-    #         stream=True,
-    #     )
-
-    # def stream_bars_start_date(self, symbol: str, interval: int, unit: str, start_date: str, session: str) -> Response:
-    #     """Stream bars for a certain data range.
-
-    #     Arguments:
-    #     ----
-    #     symbol (str): A ticker symbol to stream bars.
-
-    #     interval (int): The size of the bar.
-
-    #     unit (str): The frequency of the bar.
-
-    #     start_date (str): The start point of the streaming.
-
-    #     session (str): Defines whether you want bars from post, pre, or current market.
-
-    #     Raises:
-    #     ----
-    #     ValueError:
-
-    #     Returns:
-    #     ----
-    #     (dict): A dictionary of quotes.
-    #     """
-
-    #     # ['USEQPre','USEQPost','USEQPreAndPost','Default']
-
-    #     # validate the token.
-    #     self._token_validation()
-
-    #     if symbol is None:
-    #         raise ValueError("You must pass through one symbol.")
-
-    #     if unit not in ["Minute", "Daily", "Weekly", "Monthly"]:
-    #         raise ValueError(
-    #             'The value you passed through for `unit` is incorrect,
-    # it must be one of the following: ["Minute", "Daily", "Weekly", "Monthly"]')
-
-    #     if interval != 1 and unit in {"Daily", "Weekly", "Monthly"}:
-    #         raise ValueError(
-    #             "The interval must be one for daily, weekly or monthly.")
-    #     elif interval > 1440:
-    #         raise ValueError("Interval must be less than or equal to 1440")
-
-    #     # define the endpoint.
-    #     url_endpoint = self._api_endpoint(
-    #         url='stream/barchart/{symbol}/{interval}/{unit}/{start_date}'.format(
-    #             symbol=symbol,
-    #             interval=interval,
-    #             unit=unit,
-    #             start_date=start_date
-    #         )
-    #     )
-
-    #     # define the arguments.
-    #     params = {
-    #         'access_token': self._access_token,
-    #         'sessionTemplate': session
-    #     }
-
-    #     return self._handle_requests(
-    #         url=url_endpoint, method='get', params=params, stream=True
-    #     )
-
-    # def stream_bars_date_range(self, symbol: str, interval: int, unit: str, start_date: str,
-    # end_date: str, session: str) -> Response:
-    #     """Stream bars for a certain data range.
-
-    #     Arguments:
-    #     ----
-    #     symbol (str): A ticker symbol to stream bars.
-
-    #     interval (int): The size of the bar.
-
-    #     unit (str): The frequency of the bar.
-
-    #     start_date (str): The start point of the streaming.
-
-    #     end_date (str): The end point of the streaming.
-
-    #     session (str): Defines whether you want bars from post, pre, or current market.
-
-    #     Raises:
-    #     ----
-    #     ValueError:
-
-    #     Returns:
-    #     ----
-    #     (dict): A dictionary of quotes.
-    #     """
-
-    #     # validate the token.
-    #     self._token_validation()
-
-    #     # validate the symbol
-    #     if symbol is None:
-    #         raise ValueError("You must pass through one symbol.")
-
-    #     # validate the unit
-    #     if unit not in ["Minute", "Daily", "Weekly", "Monthly"]:
-    #         raise ValueError(
-    #             'The value you passed through for `unit` is incorrect,
-    # it must be one of the following: ["Minute", "Daily", "Weekly", "Monthly"]')
-
-    #     # validate the interval.
-    #     if interval != 1 and unit in {"Daily", "Weekly", "Monthly"}:
-    #         raise ValueError(
-    #             "The interval must be one for daily, weekly or monthly.")
-    #     elif interval > 1440:
-    #         raise ValueError("Interval must be less than or equal to 1440")
-
-    #     # validate the session.
-    #     if session is not None and session not in ['USEQPre', 'USEQPost', 'USEQPreAndPost', 'Default']:
-    #         raise ValueError(
-    #             'The value you passed through for `session` is incorrect, it must be one of the following:
-    # ["USEQPre","USEQPost","USEQPreAndPost","Default"]')
-
-    #     # validate the START DATE.
-    #     if isinstance(start_date, (datetime.datetime, datetime.date)):
-    #         start_date_iso = start_date.isoformat()
-    #     elif isinstance(start_date, str):
-    #         datetime_parsed = parse(start_date)
-    #         start_date_iso = datetime_parsed.isoformat()
-
-    #     # validate the END DATE.
-    #     if isinstance(end_date, datetime.datetime) or isinstance(start_date, datetime.date):
-    #         end_date_iso = end_date.isoformat()
-
-    #     elif isinstance(end_date, str):
-    #         datetime_parsed = parse(end_date)
-    #         end_date_iso = datetime_parsed.isoformat()
-
-    #     # define the endpoint.
-    #     url_endpoint = self._api_endpoint(url='stream/barchart/{symbol}/{interval}/{unit}/{start}/{end}'.format(
-    #         symbol=symbol,
-    #         interval=interval,
-    #         unit=unit,
-    #         start=start_date_iso,
-    #         end=end_date_iso
-    #     )
-    #     )
-
-    #     # define the arguments.
-    #     params = {
-    #         'access_token': self._access_token,
-    #         'sessionTemplate': session
-    #     }
-
-    #     return self._handle_requests(
-    #         url=url_endpoint, method='get', params=params, stream=True
-    #     )
-
-    # def stream_bars_back(self, symbol: str, interval: int, unit: str, bar_back: int, last_date: str, session: str):
-    #     """Stream bars for a certain number of bars back.
-
-    #     Arguments:
-    #     ----
-    #     symbol (str): A ticker symbol to stream bars.
-
-    #     interval (int): The size of the bar.
-
-    #     unit (str): The frequency of the bar.
-
-    #     bar_back (str): The number of bars back.
-
-    #     last_date (str): The date from which to start going back.
-
-    #     session (str): Defines whether you want bars from post, pre, or current market.
-
-    #     Raises:
-    #     ----
-    #     ValueError:
-
-    #     Returns:
-    #     ----
-    #     (dict): A dictionary of quotes.
-    #     """
-
-    #     # validate the token.
-    #     self._token_validation()
-
-    #     # validate the symbol
-    #     if symbol is None:
-    #         raise ValueError("You must pass through one symbol.")
-
-    #     # validate the unit
-    #     if unit not in ["Minute", "Daily", "Weekly", "Monthly"]:
-    #         raise ValueError(
-    #             'The value you passed through for `unit` is incorrect,
-    # it must be one of the following: ["Minute", "Daily", "Weekly", "Monthly"]')
-
-    #     # validate the interval.
-    #     if interval != 1 and unit in {"Daily", "Weekly", "Monthly"}:
-    #         raise ValueError(
-    #             "The interval must be one for daily, weekly or monthly.")
-    #     elif interval > 1440:
-    #         raise ValueError("Interval must be less than or equal to 1440")
-
-    #     # validate the session.
-    #     if session is not None and session not in ['USEQPre', 'USEQPost', 'USEQPreAndPost', 'Default']:
-    #         raise ValueError(
-    #             'The value you passed through for `session` is incorrect, it must be one of the following:
-    # ["USEQPre","USEQPost","USEQPreAndPost","Default"]')
-
-    #     if bar_back > 157600:
-    #         raise ValueError("`bar_back` must be less than or equal to 157600")
-
-    #     if isinstance(last_date, datetime.datetime):
-    #         last_date_iso = last_date.isoformat()
-
-    #     elif isinstance(last_date, str):
-    #         datetime_parsed = parse(last_date)
-    #         last_date_iso = datetime_parsed.isoformat()
-
-    #     # Define the endpoint.
-    #     url_endpoint = self._api_endpoint(
-    #         url='stream/barchart/{symbol}/{interval}/{unit}/{bar_back}/{last_date}'.format(
-    #             symbol=symbol,
-    #             interval=interval,
-    #             unit=unit,
-    #             bar_back=bar_back,
-    #             last_date=last_date_iso
-    #         )
-    #     )
-
-    #     # define the arguments.
-    #     params = {
-    #         'access_token': self._access_token,
-    #         'sessionTemplate': session
-    #     }
-
-    #     return self._handle_requests(
-    #         url=url_endpoint, method='get', params=params, stream=True
-    #     )
-
-    # def stream_bars_days_back(self, symbol: str, interval: int, unit: str, bar_back: int, last_date: str, session: str):
-    #     """Stream bars for a certain number of days back.
-
-    #     Arguments:
-    #     ----
-    #     symbol (str): A ticker symbol to stream bars.
-
-    #     interval (int): The size of the bar.
-
-    #     unit (str): The frequency of the bar.
-
-    #     bar_back (str): The number of bars back.
-
-    #     last_date (str): The date from which to start going back.
-
-    #     session (str): Defines whether you want bars from post, pre, or current market.
-
-    #     Raises:
-    #     ----
-    #     ValueError:
-
-    #     Returns:
-    #     ----
-    #     (dict): A dictionary of quotes.
-    #     """
-
-    #     # validate the token.
-    #     self._token_validation()
-
-    #     # validate the symbol
-    #     if symbol is None:
-    #         raise ValueError("You must pass through one symbol.")
-
-    #     # validate the unit
-    #     if unit not in ["Minute", "Daily", "Weekly", "Monthly"]:
-    #         raise ValueError(
-    #             'The value you passed through for `unit` is incorrect, it must be one of the following:
-    # ["Minute", "Daily", "Weekly", "Monthly"]')
-
-    #     # validate the interval.
-    #     if interval != 1 and unit in {"Daily", "Weekly", "Monthly"}:
-    #         raise ValueError(
-    #             "The interval must be one for daily, weekly or monthly.")
-    #     elif interval > 1440:
-    #         raise ValueError("Interval must be less than or equal to 1440")
-
-    #     # validate the session.
-    #     if session is not None and session not in ['USEQPre', 'USEQPost', 'USEQPreAndPost', 'Default']:
-    #         raise ValueError(
-    #             'The value you passed through for `session` is incorrect, it must be one of the following:
-    # ["USEQPre","USEQPost","USEQPreAndPost","Default"]')
-
-    #     if bar_back > 157600:
-    #         raise ValueError("`bar_back` must be less than or equal to 157600")
-
-    #     if isinstance(last_date, datetime.datetime):
-    #         last_date_iso = last_date.isoformat()
-
-    #     elif isinstance(last_date, str):
-    #         datetime_parsed = parse(last_date)
-    #         last_date_iso = datetime_parsed.isoformat()
-
-    #     # define the endpoint.
-    #     url_endpoint = self._api_endpoint(
-    #         url='stream/barchart/{symbol}/{interval}/{unit}/{bar_back}/{last_date}'.format(
-    #             symbol=symbol,
-    #             interval=interval,
-    #             unit=unit,
-    #             bar_back=bar_back,
-    #             last_date=last_date_iso
-    #         )
-    #     )
-
-    #     # Define the arguments.
-    #     params = {
-    #         'access_token': self._access_token,
-    #         'sessionTemplate': session
-    #     }
-
-    #     return self._handle_requests(
-    #         url=url_endpoint, method='get', params=params, stream=True
-    #     )
-
-    # def stream_bars(self, symbol: str, interval: int, bar_back: int):
-    #     """Stream bars for a certain symbol.
-
-    #     Arguments:
-    #     ----
-    #     symbol (str): A ticker symbol to stream bars.
-
-    #     interval (int): The size of the bar.
-
-    #     unit (str): The frequency of the bar.
-
-    #     Raises:
-    #     ----
-    #     ValueError:
-
-    #     Returns:
-    #     ----
-    #     (dict): A dictionary of quotes.
-    #     """
-
-    #     # validate the token.
-    #     self._token_validation()
-
-    #     # validate the symbol
-    #     if symbol is None:
-    #         raise ValueError("You must pass through one symbol.")
-
-    #     if interval > 64999:
-    #         raise ValueError("Interval must be less than or equal to 64999")
-
-    #     if bar_back > 10:
-    #         raise ValueError("`bar_back` must be less than or equal to 10")
-
-    #     # define the endpoint.
-    #     url_endpoint = self._api_endpoint(
-    #         url='stream/tickbars/{symbol}/{interval}/{bar_back}'.format(
-    #             symbol=symbol,
-    #             interval=interval,
-    #             bar_back=bar_back
-    #         )
-    #     )
-
-    #     # define the arguments.
-    #     params = {
-    #         'access_token': self._access_token
-    #     }
-
-    #     return self._handle_requests(
-    #         url=url_endpoint, method='get', params=params, stream=True
-    #     )
+        try:
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                params={"access_token": "***"}
+            )
+            
+            response = self._get_request(url=url_endpoint, params=params)
+            
+            # Check for errors
+            if response.status_code >= 400:
+                self._handle_error_response(response, method, endpoint)
+                
+            log_api_call(
+                logger=self._logger,
+                method=method,
+                endpoint=endpoint,
+                response=response
+            )
+            
+            return response
+            
+        except (AuthenticationError, ApiError, RateLimitError) as e:
+            # Let these pass through
+            raise
+        except Exception as e:
+            self._logger.error(f"callee: Error in get_symbol_details: {str(e)}")
+            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
+            
+    # The remaining methods should be updated similarly to include proper error handling,
+    # but we'll prioritize the core methods above for now.

@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import secrets
-from typing import Any, Callable, Dict, Union
+from typing import Any, Callable, Dict, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -28,11 +28,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from httpx import AsyncClient, Client, Response
 from pathlib import Path
-import platformdirs  # We'd add this to poetry dependencies
 
 from .client.asynchronous import AsyncClient
 from .client.synchronous import Client
-from .logger import get_logger
+from .logger import get_logger, log_api_call
 
 AUTH_ENDPOINT = "https://signin.tradestation.com/authorize"
 # nosec - This isn't a hardcoded password
@@ -40,109 +39,113 @@ TOKEN_ENDPOINT = "https://signin.tradestation.com/oauth/token"
 AUDIENCE_ENDPOINT = "https://api.tradestation.com"
 
 PAPER_ENDPOINT = "https://api.tradestation.com/v2/paper"
-AUDIENCE_ENDPOINT = "https://api.tradestation.com/v2/live"
+LIVE_ENDPOINT = "https://api.tradestation.com/v2/live"
 
 
-def __update_token(token_path: str) -> Callable:
+class AuthError(Exception):
+    """Exception raised for authentication errors."""
+    pass
+
+
+class CredentialProvider(ABC):
+    """Abstract base class for credential providers.
+    
+    This allows clients to implement their own credential storage and retrieval
+    mechanisms without the library knowing about storage locations.
     """
-    Return a function to update the token information and save it to a file.
+    
+    @abstractmethod
+    def get_client_key(self) -> str:
+        """Return the client key (client ID) for API authentication."""
+        pass
+    
+    @abstractmethod
+    def get_client_secret(self) -> str:
+        """Return the client secret for API authentication."""
+        pass
+    
+    @abstractmethod
+    def get_redirect_uri(self) -> str:
+        """Return the redirect URI for OAuth flow."""
+        pass
 
-    Parameters:
-    - token_path (str): The path where the token information will be saved.
 
-    Returns:
-    - Callable: A function that takes a token dictionary and saves it to a file.
-
-    Example Usage:
-    ```
-    update_func = __update_token("path/to/token.json")
-    update_func(token_dict)
-    ```
-
-    Notes:
-    - The returned function will save the token in JSON format.
+class TokenStorage(ABC):
+    """Abstract base class for token storage.
+    
+    This allows clients to implement their own token storage mechanisms.
     """
-
-    def update_token(t: Any) -> None:
-        """
-        Update the token information and saves it to a file.
-
-        Parameters:
-        - t (Any): The token information to be saved. Could be a dictionary, list, or any serializable type.
-
+    
+    @abstractmethod
+    def save_token(self, token_data: Dict[str, Any]) -> bool:
+        """Save token data to storage.
+        
+        Args:
+            token_data: Dictionary containing token information
+            
         Returns:
-        - None
-
-        Example Usage:
-        ```
-        update_token(token_dict)
-        ```
-
-        Notes:
-        - The function saves the token in JSON format to a file specified by `token_path`.
-        - The function uses a logger to log the path to which the token is saved.
-
-        Warnings:
-        - The `token_path` and `get_logger()` are assumed to be available in the function's scope.
+            bool: Success or failure
         """
-        get_logger().info("Updating token to file %s", token_path)
-
-        with open(token_path, "w") as f:
-            json.dump(t, f, indent=4)
-
-    return update_token
-
-
-def __token_loader(token_path: str) -> Callable[[], Dict[str, Any]]:
-    """
-    Return a function to load the token information from a file.
-
-    Parameters:
-    - token_path (str): The path from where the token information will be loaded.
-
-    Returns:
-    - Callable: A function that loads and returns a token dictionary.
-
-    Example Usage:
-    ```
-    load_func = __token_loader("path/to/token.json")
-    token_dict = load_func()
-    ```
-
-    Notes:
-    - The returned function will read the token from a JSON file.
-    """
-
-    def load_token() -> Any:
-        """
-        Load the token information from a file and returns it.
-
+        pass
+    
+    @abstractmethod
+    def load_token(self) -> Optional[Dict[str, Any]]:
+        """Load token data from storage.
+        
         Returns:
-        - Any: The token information, typically a dictionary or list, or any deserializable type.
-
-        Example Usage:
-        ```
-        token_data = load_token()
-        ```
-
-        Notes:
-        - The function reads the token from a JSON file specified by `token_path`.
-        - The function uses a logger to log the path from which the token is loaded.
-
-        Warnings:
-        - The `token_path` and `get_logger()` are assumed to be available in the function's scope.
-
-        Raises:
-        - FileNotFoundError: If the specified `token_path` does not exist.
-        - JSONDecodeError: If the file does not contain valid JSON data.
+            Optional[Dict[str, Any]]: Token data if available, None otherwise
         """
-        get_logger().info("Loading token from file %s", token_path)
+        pass
 
-        with open(token_path, "rb") as f:
-            token_data = f.read()
-            return json.loads(token_data.decode())
 
-    return load_token
+class FileTokenStorage(TokenStorage):
+    """Implementation of TokenStorage that uses a file for storage."""
+    
+    def __init__(self, token_path: str):
+        """Initialize with token file path.
+        
+        Args:
+            token_path: Path to the token file
+        """
+        self.token_path = token_path
+        self.logger = get_logger(__name__, caller=False)
+    
+    def save_token(self, token_data: Dict[str, Any]) -> bool:
+        """Save token data to a file.
+        
+        Args:
+            token_data: Dictionary containing token information
+            
+        Returns:
+            bool: Success or failure
+        """
+        try:
+            self.logger.info(f"callee: Saving token to file {self.token_path}")
+            with open(self.token_path, "w") as f:
+                json.dump(token_data, f, indent=4)
+            return True
+        except Exception as e:
+            self.logger.error(f"callee: Failed to save token: {str(e)}")
+            return False
+    
+    def load_token(self) -> Optional[Dict[str, Any]]:
+        """Load token data from a file.
+        
+        Returns:
+            Optional[Dict[str, Any]]: Token data if available, None otherwise
+        """
+        try:
+            if not os.path.exists(self.token_path):
+                self.logger.warning(f"callee: Token file not found: {self.token_path}")
+                return None
+                
+            self.logger.info(f"callee: Loading token from file {self.token_path}")
+            with open(self.token_path, "rb") as f:
+                token_data = f.read()
+                return json.loads(token_data.decode())
+        except Exception as e:
+            self.logger.error(f"callee: Failed to load token: {str(e)}")
+            return None
 
 
 def get_default_token_path() -> str:
@@ -155,36 +158,82 @@ def get_default_token_path() -> str:
 
 
 def easy_client(
-    client_key: str,
-    client_secret: str,
-    redirect_uri: str,
-    token_path: str = None,
+    credential_provider: Optional[CredentialProvider] = None,
+    client_key: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    redirect_uri: Optional[str] = None,
+    token_storage: Optional[TokenStorage] = None,
+    token_path: Optional[str] = None,
     paper_trade: bool = True,
     asyncio: bool = False
-) -> AsyncClient | Client:
+) -> Union[AsyncClient, Client]:
     """
     Initialize and return a client object based on existing token or manual flow.
+    
+    This function accepts either a CredentialProvider or directly provided credentials.
+    It also accepts either a TokenStorage or a token_path for default file storage.
 
     Args:
-        token_path: Optional path to token file. If None, uses default location.
+        credential_provider: Optional provider for client credentials
+        client_key: Optional client key (ID) if not using credential_provider
+        client_secret: Optional client secret if not using credential_provider
+        redirect_uri: Optional redirect URI if not using credential_provider
+        token_storage: Optional TokenStorage implementation
+        token_path: Optional path to token file if not using token_storage
+        paper_trade: Whether to use paper trading (default: True)
+        asyncio: Whether to return an async client (default: False)
+        
+    Returns:
+        Client or AsyncClient instance
+        
+    Raises:
+        ValueError: If neither credential_provider nor direct credentials are provided
     """
-    logger = get_logger()
-    token_path = token_path or get_default_token_path()
-
-    if os.path.isfile(token_path):
-        c = client_from_token_file(
-            client_key, client_secret, paper_trade, asyncio, token_path=token_path)
-        logger.info(f"Returning client loaded from token file '{token_path}'")
+    logger = get_logger(__name__, caller=True)
+    
+    # Get credentials
+    if credential_provider:
+        key = credential_provider.get_client_key()
+        secret = credential_provider.get_client_secret()
+        redirect = credential_provider.get_redirect_uri()
+    elif client_key and client_secret and redirect_uri:
+        key = client_key
+        secret = client_secret
+        redirect = redirect_uri
     else:
-        logger.warning(f"Failed to find token file '{token_path}'")
-        c = client_from_manual_flow(
-            client_key, client_secret, redirect_uri, paper_trade, asyncio, token_path=token_path)
-    return c
+        raise ValueError("Must provide either credential_provider or all of client_key, client_secret, and redirect_uri")
+    
+    # Set up token storage
+    if token_storage is None:
+        token_path = token_path or get_default_token_path()
+        token_storage = FileTokenStorage(token_path)
+    
+    # Load token and create client
+    token_data = token_storage.load_token()
+    
+    if token_data:
+        logger.info("caller: Creating client from saved token")
+        return client_from_token_data(
+            key, secret, token_data, token_storage.save_token,
+            paper_trade=paper_trade, asyncio=asyncio
+        )
+    else:
+        logger.warning("caller: No token found, initiating manual flow")
+        return client_from_manual_flow(
+            key, secret, redirect,
+            token_update_func=token_storage.save_token,
+            paper_trade=paper_trade, asyncio=asyncio
+        )
 
 
 def client_from_manual_flow(
-    client_key: str, client_secret: str, redirect_uri: str, paper_trade: bool = True, asyncio: bool = False, token_path: str = None
-) -> AsyncClient | Client:
+    client_key: str, 
+    client_secret: str, 
+    redirect_uri: str, 
+    token_update_func: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    paper_trade: bool = True, 
+    asyncio: bool = False
+) -> Union[AsyncClient, Client]:
     """
     Initialize and return a client object by manually completing the OAuth2 flow.
 
@@ -192,9 +241,9 @@ def client_from_manual_flow(
     - client_key (str): The client key for authentication.
     - client_secret (str): The client secret for authentication.
     - redirect_uri (str): The redirect URI for OAuth.
+    - token_update_func (Callable, optional): Function to update token storage
     - paper_trade (bool, optional): Flag to indicate if the client should operate in paper trade mode. Default is True.
     - asyncio (bool, optional): Flag to indicate if the client should be asynchronous. Default is False.
-    - token_path (str, optional): The path to the token file. Default is None.
 
     Returns:
     - AsyncClient | Client: An instance of either the AsyncClient or Client class,
@@ -209,6 +258,9 @@ def client_from_manual_flow(
     - Follow the printed instructions to visit the authorization URL and paste the full redirect URL.
     - The function will automatically request tokens and initialize the client.
     """
+    logger = get_logger(__name__, caller=True)
+    logger.info("caller: Initiating manual OAuth flow")
+    
     # Build the Authorization URL
     params = {
         "response_type": "code",
@@ -218,151 +270,145 @@ def client_from_manual_flow(
         # Ideally, this should be dynamically generated for each request
         "state": secrets.token_hex(16),
         "scope": "openid MarketData profile ReadAccount Trade Matrix OptionSpreads email offline_access",
-
     }
-    url = httpx.get(AUTH_ENDPOINT, params=params).url
-    print(f"Please go to this URL to authorize the application: {url}")
-
-    # Obtain Authorization Code from User
-    auth_redirect = input(
-        "Please enter the full redirect URL you were returned to: ")
-    parsed_url = urlparse(auth_redirect)
-    query_params = parse_qs(parsed_url.query)
-    authorization_code = query_params.get("code", [])[0].strip()
-
-    # Request Tokens Using Authorization Code
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": client_key,
-        "client_secret": client_secret,
-        "code": authorization_code,
-        "redirect_uri": redirect_uri,
-    }
-    headers = {"content-type": "application/x-www-form-urlencoded"}
-    response: httpx.Response = httpx.post(
-        TOKEN_ENDPOINT, data=payload, headers=headers)
-
-    if response.status_code == httpx._status_codes.codes.BAD_REQUEST:
-        print(f"Failed to authorize token. {response.status_code}")
-        # Or raise an exception
-        raise ValueError(f"Failed to authorize token. {response.status_code}")
-
-    token: dict[str, Union[str, int]] = response.json()
-
-    # Update Token State (this function should be defined elsewhere)
-    update_token = __update_token(token_path)
-    update_token(token)
-
-    # Initialize the Client
-    client_object: type[AsyncClient] | type[Client] = AsyncClient if asyncio else Client
-
-    return client_object(
-        client_id=client_key,
-        client_secret=client_secret,
-        paper_trade=paper_trade,
-        _access_token=str(token.get("access_token")),
-        _refresh_token=str(token.get("refresh_token")),
-        _access_token_expires_in=int(token.get("access_token_expires_in", 0)),
-        _access_token_expires_at=int(token.get("access_token_expires_at", 0)),
-    )
-
-
-def client_from_token_file(
-    client_key: str, client_secret: str, paper_trade: bool = True, asyncio: bool = False, token_path: str = None
-) -> AsyncClient | Client:
-    """
-    Initialize and return a client object based on a given token file.
-
-    Parameters:
-    - client_id (str): The client ID for authentication.
-    - client_secret (str): The client secret for authentication.
-    - token_path (str, optional): The file location for the token data. Default is None.
-    - paper_trade (bool, optional): Flag to indicate if the client should operate in paper trade mode. Default is True.
-    - asyncio (bool, optional): Flag to indicate if the client should be asynchronous. Default is False.
-
-    Returns:
-    - AsyncClient | Client: An instance of either the AsyncClient or Client class,
-        initialized with the provided tokens and settings.
-
-    Example Usage:
-    ```
-    client = client_from_token_file("client_id", "client_secret", paper_trade=True, asyncio=False)
-    ```
-
-    Notes:
-    - The 'token_read_func' should return a dictionary with the following keys:
-        - "access_token": The access token for authentication.
-        - "refresh_token": The refresh token for refreshing the access token. (optional)
-        - "access_token_expires_in": The lifetime of the access token in seconds. (optional)
-        - "access_token_expires_at": The expiration timestamp of the access token. (optional)
-    """
-    return client_from_access_functions(
-        client_key,
-        client_secret,
-        __token_loader(token_path),
-        __update_token(token_path),
-        paper_trade,
-        asyncio,
-    )
-
-
-def client_from_access_functions(
-    client_key: str,
-    client_secret: str,
-    token_read_func: Callable,
-    token_update_func: Callable,
-    paper_trade: bool = True,
-    asyncio: bool = False,
-) -> AsyncClient | Client:
-    """
-    Initialize and return a client object based on the provided access functions and settings.
-
-    Parameters:
-    - client_id (str): The client ID for authentication.
-    - client_secret (str): The client secret for authentication.
-    - token_read_func (callable): A function that returns a dictionary containing token information.
-    - token_update_func (callable): A function that takes token data and persists it.
-    - paper_trade (bool, optional): Flag to indicate if the client should operate in paper trade mode. Default is True.
-    - asyncio (bool, optional): Flag to indicate if the client should be asynchronous. Default is False.
-
-    Returns:
-    - AsyncClient | Client: An instance of either the AsyncClient or Client class,
-        initialized with the provided tokens and settings.
-
-    Example Usage:
-    ```
-    def read_token():
-        return {
-            "access_token": "some_access_token",
-            "refresh_token": "some_refresh_token",
-            "access_token_expires_in": 3600,
-            "access_token_expires_at": 1678900000
+    
+    try:
+        url = httpx.get(AUTH_ENDPOINT, params=params).url
+        print(f"Please go to this URL to authorize the application: {url}")
+    
+        # Obtain Authorization Code from User
+        auth_redirect = input("Please enter the full redirect URL you were returned to: ")
+        parsed_url = urlparse(auth_redirect)
+        query_params = parse_qs(parsed_url.query)
+        
+        if 'code' not in query_params:
+            raise AuthError("No authorization code found in the redirect URL")
+        
+        authorization_code = query_params.get("code", [])[0].strip()
+    
+        # Request Tokens Using Authorization Code
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": client_key,
+            "client_secret": client_secret,
+            "code": authorization_code,
+            "redirect_uri": redirect_uri,
         }
+        headers = {"content-type": "application/x-www-form-urlencoded"}
+        
+        log_api_call(
+            logger=logger,
+            method="POST",
+            endpoint=TOKEN_ENDPOINT,
+            data=payload,
+            headers=headers
+        )
+        
+        response: httpx.Response = httpx.post(
+            TOKEN_ENDPOINT, data=payload, headers=headers)
+    
+        if response.status_code != 200:
+            error_msg = f"Failed to authorize token. {response.status_code}"
+            logger.error(f"caller: {error_msg}")
+            raise AuthError(error_msg)
+    
+        token: Dict[str, Union[str, int]] = response.json()
+        logger.info("caller: Successfully obtained authorization token")
+    
+        # Update Token State if function provided
+        if token_update_func:
+            token_update_func(token)
+    
+        # Initialize the Client
+        client_object: type[AsyncClient] | type[Client] = AsyncClient if asyncio else Client
+    
+        return client_object(
+            client_id=client_key,
+            client_secret=client_secret,
+            paper_trade=paper_trade,
+            _access_token=str(token.get("access_token")),
+            _refresh_token=str(token.get("refresh_token")),
+            _access_token_expires_in=int(token.get("expires_in", 0)),
+            _access_token_expires_at=int(token.get("expires_at", 0)),
+            _token_update_func=token_update_func,
+        )
+    except Exception as e:
+        logger.error(f"caller: Authentication error: {str(e)}")
+        raise
 
-    client = client_from_access_functions("client_id", "client_secret", read_token, paper_trade=True, asyncio=False)
-    ```
 
-    Notes:
-    - The 'token_read_func' should return a dictionary with the following keys:
-        - "access_token": The access token for authentication.
-        - "refresh_token": The refresh token for refreshing the access token. (optional)
-        - "access_token_expires_in": The lifetime of the access token in seconds. (optional)
-        - "access_token_expires_at": The expiration timestamp of the access token. (optional)
+def client_from_token_data(
+    client_key: str,
+    client_secret: str, 
+    token_data: Dict[str, Any],
+    token_update_func: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    paper_trade: bool = True, 
+    asyncio: bool = False
+) -> Union[AsyncClient, Client]:
     """
-    token: dict = token_read_func()
+    Initialize and return a client object based on token data.
 
+    Parameters:
+    - client_key (str): The client ID for authentication.
+    - client_secret (str): The client secret for authentication.
+    - token_data (Dict[str, Any]): Dictionary containing token information
+    - token_update_func (Callable, optional): Function to update token storage
+    - paper_trade (bool, optional): Flag to indicate if the client should operate in paper trade mode. Default is True.
+    - asyncio (bool, optional): Flag to indicate if the client should be asynchronous. Default is False.
+
+    Returns:
+    - AsyncClient | Client: An instance of either the AsyncClient or Client class,
+        initialized with the provided tokens and settings.
+    """
+    logger = get_logger(__name__, caller=True)
+    logger.info("caller: Creating client from token data")
+    
     client_object: type[AsyncClient] | type[Client] = AsyncClient if asyncio else Client
-
+    
     return client_object(
         client_id=client_key,
         client_secret=client_secret,
         paper_trade=paper_trade,
-        _access_token=token.get("access_token"),
-        _refresh_token=token.get("refresh_token", ""),
-        _access_token_expires_in=token.get("access_token_expires_in", 0),
-        _access_token_expires_at=token.get("access_token_expires_at", 0),
-        _token_read_func=token_read_func,
+        _access_token=token_data.get("access_token"),
+        _refresh_token=token_data.get("refresh_token", ""),
+        _access_token_expires_in=token_data.get("expires_in", 0),
+        _access_token_expires_at=token_data.get("expires_at", 0),
         _token_update_func=token_update_func,
     )
 
 
+def client_from_token_file(
+    client_key: str, 
+    client_secret: str, 
+    token_path: str,
+    paper_trade: bool = True, 
+    asyncio: bool = False
+) -> Union[AsyncClient, Client]:
+    """
+    Initialize and return a client object based on a given token file.
+
+    Parameters:
+    - client_key (str): The client ID for authentication.
+    - client_secret (str): The client secret for authentication.
+    - token_path (str): The file location for the token data.
+    - paper_trade (bool, optional): Flag to indicate if the client should operate in paper trade mode. Default is True.
+    - asyncio (bool, optional): Flag to indicate if the client should be asynchronous. Default is False.
+
+    Returns:
+    - AsyncClient | Client: An instance of either the AsyncClient or Client class,
+        initialized with the provided tokens and settings.
+    """
+    token_storage = FileTokenStorage(token_path)
+    token_data = token_storage.load_token()
+    
+    if not token_data:
+        raise ValueError(f"No valid token data found in file: {token_path}")
+        
+    return client_from_token_data(
+        client_key,
+        client_secret,
+        token_data,
+        token_storage.save_token,
+        paper_trade,
+        asyncio
+    )
