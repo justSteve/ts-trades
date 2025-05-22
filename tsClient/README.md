@@ -23,4 +23,4 @@ Prefix log msgs with 'caller: ' or 'callee:'
 
 RESOURCES:
 
-https://api.tradestation.com/docs/specification/ We'll be using the V3 api. The OpenAPI spec is stored in the root of this project.
+<https://api.tradestation.com/docs/specification/> We'll be using the V3 api. The OpenAPI spec is stored in the root of this project.

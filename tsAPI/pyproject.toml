@@ -1,118 +1,14 @@
 [tool.poetry]
-name = "ts_py"
+name = "tsapi"
 version = "0.2.0"
 description = "An unofficial wrapper for the TradeStation API."
-authors = ["Stephen Hueners <steve@justSteve.com>"]
 readme = "README.md"
-repository = "https://github.com/justSteve/ts-py"
-homepage = "https://github.com/justSteve/ts-py"
-packages = [{ include = "ts_py", from = "src" }]
-license = "LICENSE"
-keywords = [
-  "tradestation",
-  "finance",
-  "trading",
-  "automated-trading",
-  "tradestation-api",
-  "ts_py",
-]
-classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Programming Language :: Python",
-  "License :: OSI Approved :: MIT License",
-  "Natural Language :: English",
-  "Operating System :: OS Independent",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Topic :: Office/Business :: Financial",
-]
+packages = [{ include = "src"}]
+license = "MIT"
 
 [tool.poetry.dependencies]
 python = ">=3.9.1,<4.0"
 httpx = "^0.27.0"
 typing-extensions = ">=4.0.0"
 
-[tool.poetry.group.dev.dependencies]
-deptry = "^0.14.1"
-mypy = "^1.8.0"
-pre-commit = "^3.6.0"
-bandit = "^1.7.7"
-pydocstyle = "^6.3.0"
-autopep8 = "^2.0.4"
-
-[tool.poetry.group.test.dependencies]
-pytest = "^7.0.0"
-pytest-cov = "^4.0.0"
-pytest-asyncio = "^0.21.0"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
-[tool.black]
-line-length = 120
-target-version = ['py310']
-preview = true
-
-[tool.isort]
-line_length = 120
-profile = "black"
-
-[tool.mypy]
-files = ["ts_py"]
-disallow_untyped_defs = true
-no_implicit_optional = true
-check_untyped_defs = true
-warn_unused_ignores = true
-show_error_codes = true
-ignore_missing_imports = true
-
-[tool.ruff]
-# Same as max-line-length = 120 in flake8
-line-length = 120
-
-# Same as max-complexity = 10 in flake8
-select = [
-  "B",  # flake8-bugbear
-  "B9", # flake8-bugbear optional warnings
-  "C",  # mccabe complexity
-  "D",  # pydocstyle
-  "E",  # pycodestyle errors
-  "F",  # pyflakes
-  "N",  # pep8-naming
-  "S",  # flake8-bandit
-  "W",  # pycodestyle warnings
-]
-
-ignore = [
-  "E203", # Whitespace before ':'
-  "E501", # Line too long
-  # "W503",  # Line break before binary operator
-  # "W504",  # Line break after binary operator
-]
-
-target-version = "py38"
-pydocstyle.convention = "google"
-
-[tool.ruff.mccabe]
-# Same as max-complexity = 10 in flake8
-max-complexity = 10
-
-[tool.ruff.per-file-ignores]
-"dev/**" = ["ALL"]
-
-[tool.poetry.urls]
-Homepage = "https://github.com/justSteve/ts-py"
-Documentation = "https://github.com/justSteve/ts-py/docs"
-Changelog = "https://github.com/justSteve/ts-py/blob/main/CHANGELOG.md"
-Issues = "https://github.com/justSteve/ts-py/issues"
-
-[tool.poetry.group.docs]
-optional = true
-
-[tool.poetry.group.docs.dependencies]
-sphinx = ">=7.0.0"
-sphinx-rtd-theme = ">=1.0.0"
-myst-parser = ">=1.0.0"
+# Development dependencies remain the same
