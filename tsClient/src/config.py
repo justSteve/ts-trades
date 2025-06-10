@@ -67,6 +67,10 @@ class ClientCredentials:
         """Return the redirect URI for OAuth flow."""
         return self._get_credentials()['call_back_domain']
 
+    def get_user_id(self) -> str:
+        """Return the user ID for API authentication."""
+        return self._get_credentials()['user_id']
+
     def _get_credentials(self) -> Dict[str, str]:
         """
         Read credentials from JSON file.
@@ -95,7 +99,7 @@ class ClientCredentials:
                 credentials = json.load(f)
 
             required_fields = ['client_key',
-                               'client_secret', 'call_back_domain']
+                               'client_secret', 'call_back_domain', 'user_id']
             missing_fields = [
                 field for field in required_fields if field not in credentials]
 

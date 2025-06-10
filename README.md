@@ -25,7 +25,7 @@ This project provides a Python client for interacting with the TradeStation API.
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/ts-trades.git
+   git clone https://github.com/justSteve/ts-trades
    cd ts-trades
    ```
 
@@ -43,7 +43,8 @@ This project provides a Python client for interacting with the TradeStation API.
 
 ## Configuration
 
-1. Create a credentials file at `tsClient/src/secret/credentials.json`:
+~~1. Create a credentials file at `tsClient/src/secret/credentials.json`:~~
+1. Create a credentials file at `secret/credentials.json`:
    ```json
    {
        "client_key": "YOUR_CLIENT_KEY",
@@ -101,6 +102,8 @@ if client.login():
 
 ```
 ts-trades/
+│── secret/
+│       └── credentials.json  # API credentials
 │
 ├── tsAPI/                   # TradeStation API wrapper
 │   ├── src/
@@ -117,8 +120,6 @@ ts-trades/
     ├── src/
     │   ├── config.py        # Client configuration
     │   ├── main.py          # Main client application
-    │   └── secret/
-    │       └── credentials.json  # API credentials
     └── poetry.lock, pyproject.toml   # Package configuration
 ```
 
@@ -161,8 +162,9 @@ The logs document both inputs and outputs of API calls for better traceability.
 
 ## Security Notes
 
-- Credentials are stored securely in tsClient/src/secret/credentials.json
-- Token state is stored in ts_state.json
+~~- Credentials are stored securely in tsClient/src/secret/credentials.json~~
+- Credentials are stored securely in secret/credentials.json
+- Token state is stored in secret/ts_state.json
 - Both components use OAuth2 authentication flow with TradeStation API
 
 ## Current Development Focus
@@ -170,7 +172,8 @@ The logs document both inputs and outputs of API calls for better traceability.
 The current development priorities are:
 1. Refactor authentication so client can provide credentials without library knowing storage location
 2. Standardize logging and error handling between client and API
-3. Implement login flow leading to account details retrieval
+3. All logs should be stored in the logs folder of the project root with month-day format filenames (e.g., client-05-21.csv or api-05-21.csv)
+4. Implement login flow leading to account details retrieval
 
 ## Long-term Goals
 

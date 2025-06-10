@@ -99,7 +99,7 @@ class TradeStationClient:
     def __init__(self,
                  credentials: Optional[ClientCredentials] = None,
                  token_storage: Optional[TokenStorage] = None,
-                 paper_trade: bool = True,
+                 paper_trade: bool = False,
                  user_id: Optional[str] = None):
         """
         Initialize the TradeStation client.
@@ -108,12 +108,12 @@ class TradeStationClient:
             credentials: Optional credentials provider
             token_storage: Optional token storage provider
             paper_trade: Whether to use paper trading (default: True)
-            user_id: User ID for TradeStation account
+            user_id: User ID for TradeStation account (if not provided, will use from credentials)
         """
         self.credentials = credentials or ClientCredentials()
         self.token_storage = token_storage or TokenStorage()
         self.paper_trade = paper_trade
-        self.user_id = user_id
+        self.user_id = user_id or self.credentials.get_user_id()
         self.client = None
 
         logger.info("TradeStation client initialized")
@@ -327,13 +327,11 @@ def main():
             logger.error("Login failed. Exiting.")
             return 1
 
-        # Get user ID if not provided
+        # Get user ID from credentials if not provided
         user_id = args.user_id
-        if not user_id or user_id == "YOUR_USER_ID":
-            # In a real application, you might prompt for the user ID
-            # or retrieve it from a configuration file
-            user_id = input("Please enter your TradeStation user ID: ")
-            logger.info(f"Using provided user ID: {user_id}")
+        if not user_id:
+            user_id = client.credentials.get_user_id()
+            logger.info(f"Using user ID from credentials: {user_id}")
 
         # Get accounts
         accounts = client.get_user_accounts(user_id)

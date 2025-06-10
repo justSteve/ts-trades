@@ -16,6 +16,7 @@ Long-term goal: Transition from original design to adopt conventions from [schwa
 The project follows a library-client model:
 - **tsAPI**: Handles authentication, API communication, and data models
 - **tsClient**: Provides configuration, user-facing functionality, and business logic
+However, both lib and client exist in the same repo.
 
 Current development priorities:
 1. Refactor authentication so client can provide credentials without library knowing storage location
@@ -55,13 +56,17 @@ poetry run python src/main.py
 
 ## Logging Standards
 
-- Log to CSV format in 'logs' folder with month-day format filename
-- Prefix log messages with 'caller:' or 'callee:'
+- Log to CSV format in 'logs' folder at project root with month-day format filename
+- Include a dedicated column for caller/callee instead of prefixing messages
+- Ensure message content does not contain commas to maintain CSV integrity
 - Messages should reflect error conditions detected
 - Document both input and outputs of messages in logs
+- All logs must be saved to the project root/logs folder, not component-specific log folders
 
 ## Security Notes
 
 - Credentials are stored in tsClient/src/secret/credentials.json
-- Token state is stored in ts_state.json
+- Use user_id from credentials.json file for authentication
+- Token state is stored in tsClient/src/secret/ts_state.json
 - Both components use OAuth2 authentication flow with TradeStation API
+- Default trading mode must be set to paper trading
