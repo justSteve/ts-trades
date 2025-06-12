@@ -1,5 +1,5 @@
-"""BaseClient class for the TradeStation API."""
-from ..logger import get_logger, log_api_call
+"""BaseClient class for the TradeStation API with improved logging and error handling."""
+from ..logger import get_logger, log_api_call, log_authentication_step, log_error_with_context
 import json
 import os
 import time
@@ -64,7 +64,7 @@ class NetworkError(TradeStationError):
 @dataclass
 class BaseClient(ABC):
     """
-    Tradestation API Client Class.
+    TradeStation API Client Class.
 
     Implements OAuth Authorization Code Grant workflow, handles configuration,
     and state management, adds token for authenticated calls, and performs requests
@@ -97,8 +97,10 @@ class BaseClient(ABC):
 
     def __post_init__(self) -> None:
         """Initialize the base resource field and logger."""
-        self._logger = get_logger(__name__, caller=False)
-        self._logger.info("callee: Initializing client")
+        self._logger = get_logger(__name__)
+        log_authentication_step(self._logger, "client initialization", True, 
+                               f"Paper trade: {self.paper_trade}")
+        
         self._base_resource = PAPER_ENDPOINT if self.paper_trade else AUDIENCE_ENDPOINT
         self._token_read_func = self._token_read if self._token_read_func is None else self._token_read_func
         self._token_update_func = self._token_save if self._token_update_func is None else self._token_update_func
@@ -188,9 +190,17 @@ class BaseClient(ABC):
             error_content = response.text
         
         # Log detailed error information
-        self._logger.error(f"callee: API error: {method} {url} - Status: {status_code}")
+        error_msg = f"{method} {url} - Status: {status_code}"
         if error_data:
-            self._logger.error(f"callee: Error details: {error_data}")
+            error_msg += f" - Details: {error_data}"
+        
+        log_api_call(
+            logger=self._logger,
+            method=method,
+            endpoint=url,
+            response=response,
+            error=Exception(error_msg)
+        )
         
         # Handle different error types
         if status_code == 401 or status_code == 403:
@@ -223,7 +233,7 @@ class BaseClient(ABC):
         ----
         (bool): `True` if grabbing the refresh token was successful. `False` otherwise.
         """
-        self._logger.info("callee: Refreshing access token")
+        log_authentication_step(self._logger, "token refresh", True, "Starting token refresh")
         
         # Build the parameters of our request.
         data = {
@@ -251,13 +261,14 @@ class BaseClient(ABC):
             # Save the token if the response was okay.
             if response.status_code == 200:
                 self._token_save(response=response.json())
-                self._logger.info("callee: Successfully refreshed access token")
+                log_authentication_step(self._logger, "token refresh", True, "Token refreshed successfully")
                 return True
             else:
-                self._logger.error(f"callee: Failed to refresh token: {response.status_code}")
+                log_authentication_step(self._logger, "token refresh", False, 
+                                      f"HTTP {response.status_code}")
                 return False
         except Exception as e:
-            self._logger.error(f"callee: Error refreshing token: {str(e)}")
+            log_error_with_context(self._logger, e, "token refresh")
             return False
 
     def _token_save(self, response: dict) -> bool:
@@ -295,11 +306,15 @@ class BaseClient(ABC):
             # If a custom token update function is provided, use it
             if callable(self._token_update_func):
                 try:
-                    return self._token_update_func(state)
+                    result = self._token_update_func(state)
+                    log_authentication_step(self._logger, "token save", result, 
+                                          "Custom token update function")
+                    return result
                 except Exception as e:
-                    self._logger.error(f"callee: Error in token update function: {str(e)}")
+                    log_error_with_context(self._logger, e, "custom token update function")
                     return False
 
+            log_authentication_step(self._logger, "token save", True, f"Saved to {filename}")
             return True
 
         return False
@@ -316,16 +331,17 @@ class BaseClient(ABC):
             file_path = os.path.join(dir_path, filename)
             
             if not os.path.exists(file_path):
-                self._logger.warning(f"callee: Token file not found: {file_path}")
+                self._logger.warning(f"Token file not found: {file_path}")
                 return None
                 
             with open(file=file_path, mode="r") as state_file:
                 state = json.load(fp=state_file)
                 
+            log_authentication_step(self._logger, "token read", True, f"Read from {file_path}")
             return state
             
         except Exception as e:
-            self._logger.error(f"callee: Error reading token: {str(e)}")
+            log_error_with_context(self._logger, e, "token read")
             return None
 
     def _update_token_variables(self, response: dict) -> bool:
@@ -340,8 +356,10 @@ class BaseClient(ABC):
         # Save the access token.
         if "access_token" in response:
             self._access_token = response["access_token"]
+            log_authentication_step(self._logger, "access token update", True, "Token updated")
         else:
-            self._logger.error("callee: No access token in response")
+            log_authentication_step(self._logger, "access token update", False, 
+                                  "No access token in response")
             return False
 
         # If there is a refresh token then grab it.
@@ -360,7 +378,7 @@ class BaseClient(ABC):
             # No expiration time in response, set a default (1 hour)
             self._access_token_expires_in = 3600
             self._access_token_expires_at = time.time() + 3600
-            self._logger.warning("callee: No token expiration time in response, using default")
+            self._logger.warning("No token expiration time in response, using default")
 
         return True
 
@@ -401,16 +419,17 @@ class BaseClient(ABC):
             bool: True if token is valid, False otherwise
         """
         if not self._access_token:
-            self._logger.warning("callee: No access token available")
+            log_authentication_step(self._logger, "token validation", False, "No access token available")
             return False
             
         seconds_left = self._token_seconds()
         
         if seconds_left < nseconds:
-            self._logger.info(f"callee: Token expires in {seconds_left} seconds, refreshing")
+            log_authentication_step(self._logger, "token validation", True, 
+                                  f"Token expires in {seconds_left}s, refreshing")
             return self._grab_refresh_token()
         else:
-            self._logger.debug(f"callee: Token valid for {seconds_left} more seconds")
+            self._logger.debug(f"Token valid for {seconds_left} more seconds")
             return True
 
     #############
@@ -473,66 +492,7 @@ class BaseClient(ABC):
             # Let these pass through
             raise
         except Exception as e:
-            self._logger.error(f"callee: Error in get_accounts: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    def get_wallets(self, account_id: str) -> Response:
-        """Grabs a valid crypto Account ID for the authenticated user.
-
-        Arguments:
-        ----
-        account_id (str): The account ID.
-
-        Returns:
-        ----
-        (Response): Wallet information.
-        
-        Raises:
-            AuthenticationError: If authentication fails
-            ApiError: If API returns an error
-            NetworkError: If connection issues occur
-        """
-        method = "GET"
-        endpoint = f"brokerage/accounts/{account_id}/wallets"
-        
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(url=endpoint)
-
-        # define the arguments
-        params = {"access_token": self._access_token}
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={"access_token": "***"}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_wallets: {str(e)}")
+            log_error_with_context(self._logger, e, f"get_accounts for user {user_id}")
             raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
     def get_balances(self, account_keys: list[str | int]) -> Response:
@@ -606,81 +566,7 @@ class BaseClient(ABC):
             # Let these pass through
             raise
         except Exception as e:
-            self._logger.error(f"callee: Error in get_balances: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    def get_balances_bod(self, account_keys: list[str | int]) -> Response:
-        """Grabs the beginning of day balances for each account provided.
-
-        Args:
-        ----
-        account_keys (List[str]): A list of account numbers. Can only be a max
-            of 25 account numbers
-
-        Raises:
-        ----
-        ValueError: If the list is more than 25 account numbers will raise an error.
-        AuthenticationError: If authentication fails
-        ApiError: If API returns an error
-        NetworkError: If connection issues occur
-
-        Returns:
-        ----
-        Response: A list of account balances for each of the accounts.
-        """
-        method = "GET"
-        
-        # argument validation.
-        account_keys_str = ""
-        if not account_keys or not isinstance(account_keys, list):
-            raise ValueError(
-                "You must pass a list with at least one account for account keys.")
-        elif len(account_keys) > 0 and len(account_keys) <= 25:
-            account_keys_str = ",".join(map(str, account_keys))
-        elif len(account_keys) > 25:
-            raise ValueError(
-                "You cannot pass through more than 25 account keys.")
-                
-        endpoint = f"brokerage/accounts/{account_keys_str}/bodbalances"
-
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(endpoint)
-
-        # define the arguments
-        params = {"access_token": self._access_token}
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={"access_token": "***"}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_balances_bod: {str(e)}")
+            log_error_with_context(self._logger, e, f"get_balances for accounts {account_keys_str}")
             raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
 
     def get_positions(
@@ -766,425 +652,6 @@ class BaseClient(ABC):
             # Let these pass through
             raise
         except Exception as e:
-            self._logger.error(f"callee: Error in get_positions: {str(e)}")
+            symbol_info = f" for symbols {symbols}" if symbols else ""
+            log_error_with_context(self._logger, e, f"get_positions for accounts {account_keys_str}{symbol_info}")
             raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    def get_orders(
-        self, account_keys: list[str | int], page_size: int = 600, order_ids: Optional[list[str | int]] = None
-    ) -> Response:
-        """Grab all the account orders for a list of accounts.
-
-        Overview:
-        ----
-        This endpoint is used to grab all the order from a list of accounts provided. Additionally,
-        each account will only go back 14 days when searching for orders.
-
-        Arguments:
-        ----
-        account_keys (List[str]): A list of account numbers.
-
-        since (int): Number of days to look back, max is 14 days.
-
-        page_size (int): The page size.
-
-        page_number (int, optional): The page number to return if more than one. Defaults to 0.
-
-        Raises:
-        ----
-        ValueError: If the list is more than 25 account numbers will raise an error.
-        AuthenticationError: If authentication fails
-        ApiError: If API returns an error
-        NetworkError: If connection issues occur
-
-        Returns:
-        ----
-        Response: A list of account orders for each of the accounts.
-        """
-        method = "GET"
-        
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        # argument validation, account keys.
-        account_keys_str = ""
-        if not account_keys or not isinstance(account_keys, list):
-            raise ValueError(
-                "You must pass a list with at least one account for account keys.")
-        elif len(account_keys) > 0 and len(account_keys) <= 25:
-            account_keys_str = ",".join(map(str, account_keys))
-        elif len(account_keys) > 25:
-            raise ValueError(
-                "You cannot pass through more than 25 account keys.")
-
-        # Argument Validation, Order IDs
-        if order_ids and len(order_ids) > 0 and len(order_ids) <= 50:
-            order_ids_str = f'/{",".join(map(str, order_ids))}'
-        elif order_ids and len(order_ids) > 50:
-            raise ValueError("You cannot pass through more than 50 Orders.")
-        else:
-            order_ids_str = ""
-
-        if 600 < page_size < 0 or not isinstance(page_size, int):
-            raise ValueError("Page Size must be an integer, [1..600]")
-
-        params = {
-            "access_token": self._access_token,
-            "pageSize": page_size,
-        }
-
-        endpoint = f"brokerage/accounts/{account_keys_str}/orders{order_ids_str}"
-        
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(endpoint)
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={k: "***" if k == "access_token" else v for k, v in params.items()}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_orders: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    def get_historical_orders(
-        self,
-        account_keys: list[str | int],
-        since: date,
-        page_size: int = 600,
-        order_ids: Optional[list[str | int]] = None,
-    ) -> Response:
-        """Grab all the account orders for a list of accounts.
-
-        Overview:
-        ----
-        This endpoint is used to grab all the order from a list of accounts provided. Additionally,
-        each account will only go back 90 days when searching for orders.
-
-        Arguments:
-        ----
-        account_keys (List[str]): A list of account numbers.
-
-        since (date): Starting date to look back. Limited to 90 days prior to current date.
-
-        page_size (int): The page size.
-
-        order_ids (List[str|int], optional): Optional list of order IDs to filter by.
-
-        Raises:
-        ----
-        ValueError: If the list is more than 25 account numbers or invalid parameters
-        AuthenticationError: If authentication fails
-        ApiError: If API returns an error
-        NetworkError: If connection issues occur
-
-        Returns:
-        ----
-        Response: A list of account historical orders for each of the accounts.
-        """
-        method = "GET"
-        
-        # Argument validation, account keys.
-        if not since:
-            since = date.today() - timedelta(days=90)
-
-        if 600 < page_size < 0 or not isinstance(page_size, int):
-            raise ValueError("Page Size must be an integer, [1..600]")
-
-        account_keys_str = ""
-        if not account_keys or not isinstance(account_keys, list):
-            raise ValueError(
-                "You must pass a list with at least one account for account keys.")
-        elif len(account_keys) > 0 and len(account_keys) <= 25:
-            account_keys_str = ",".join(map(str, account_keys))
-        elif len(account_keys) > 25:
-            raise ValueError(
-                "You cannot pass through more than 25 account keys.")
-
-        # Argument Validation, Order IDs
-        if order_ids and len(order_ids) > 0 and len(order_ids) <= 50:
-            order_ids_str = f'/{",".join(map(str, order_ids))}'
-        elif order_ids and len(order_ids) > 50:
-            raise ValueError("You cannot pass through more than 50 Orders.")
-        else:
-            order_ids_str = ""
-
-        # Argument Validation, Since
-        if since < date.today() - timedelta(days=90):
-            raise ValueError("Limited to 90 days prior to the current date.")
-
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        params = {
-            "access_token": self._access_token,
-            "since": since,
-            "pageSize": page_size,
-        }
-
-        endpoint = f"brokerage/accounts/{account_keys_str}/historicalorders{order_ids_str}"
-        
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(endpoint)
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={k: "***" if k == "access_token" else v for k, v in params.items()}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_historical_orders: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    ###############
-    # Market Data #
-    ###############
-
-    def get_bars(
-        self,
-        symbol: str,
-        interval: int,
-        unit: str,
-        barsback: int,
-        firstdate: datetime,
-        lastdate: datetime,
-        sessiontemplate: str,
-    ) -> Response:
-        """Get bars/candle data for a symbol.
-
-        Arguments:
-        ----
-        symbol (str): The symbol to get data for
-        interval (int): The size of each bar
-        unit (str): The unit of time for each bar (e.g., 'Minute', 'Day')
-        barsback (int): Number of bars to retrieve
-        firstdate (datetime): Start date for the data
-        lastdate (datetime): End date for the data
-        sessiontemplate (str): Session template (e.g., 'Default', 'USEQPre')
-
-        Returns:
-        ----
-        Response: The bar chart data.
-        
-        Raises:
-            AuthenticationError: If authentication fails
-            ApiError: If API returns an error
-            NetworkError: If connection issues occur
-        """
-        method = "GET"
-        endpoint = f"marketdata/barcharts/{symbol}"
-        
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(endpoint)
-
-        # define the arguments
-        params = {
-            "access_token": self._access_token,
-            "interval": interval,
-            "unit": unit,
-            "barsback": barsback,
-            "firstdate": firstdate,
-            "lastdate": lastdate,
-            "sessiontemplate": sessiontemplate,
-        }
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={k: "***" if k == "access_token" else v for k, v in params.items()}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_bars: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    def get_crypto_symbol_names(self) -> Response:
-        """Fetch all crypto Symbol Names information.
-        
-        Returns:
-            Response: List of crypto symbols
-            
-        Raises:
-            AuthenticationError: If authentication fails
-            ApiError: If API returns an error
-            NetworkError: If connection issues occur
-        """
-        method = "GET"
-        endpoint = 'marketdata/symbollists/cryptopairs/symbolnames'
-        
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(endpoint)
-
-        # define the arguments
-        params = {"access_token": self._access_token}
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={"access_token": "***"}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_crypto_symbol_names: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-
-    def get_symbol_details(self, symbols: list[str]) -> Response:
-        """Grabs the info for specific symbol(s).
-
-        Arguments:
-        ----
-        symbols (list[str]): A list of ticker symbols.
-
-        Raises:
-        ----
-        ValueError: If no symbols are provided or too many symbols.
-        AuthenticationError: If authentication fails
-        ApiError: If API returns an error
-        NetworkError: If connection issues occur
-
-        Returns:
-        ----
-        Response: A response with symbol details.
-        """
-        method = "GET"
-        
-        # validate the token.
-        if not self._token_validation():
-            raise AuthenticationError("Failed to validate access token")
-
-        if symbols is None:
-            raise ValueError("You must pass through a symbol.")
-        elif 0 > len(symbols) > 50:
-            raise ValueError("You may only send [1..50] symbols per request.")
-
-        endpoint = f'marketdata/symbols/{",".join(symbols)}'
-            
-        # define the endpoint.
-        url_endpoint = self._api_endpoint(endpoint)
-
-        # define the arguments.
-        params = {"access_token": self._access_token}
-
-        try:
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                params={"access_token": "***"}
-            )
-            
-            response = self._get_request(url=url_endpoint, params=params)
-            
-            # Check for errors
-            if response.status_code >= 400:
-                self._handle_error_response(response, method, endpoint)
-                
-            log_api_call(
-                logger=self._logger,
-                method=method,
-                endpoint=endpoint,
-                response=response
-            )
-            
-            return response
-            
-        except (AuthenticationError, ApiError, RateLimitError) as e:
-            # Let these pass through
-            raise
-        except Exception as e:
-            self._logger.error(f"callee: Error in get_symbol_details: {str(e)}")
-            raise NetworkError(f"Network error accessing {endpoint}: {str(e)}")
-            
-    # The remaining methods should be updated similarly to include proper error handling,
-    # but we'll prioritize the core methods above for now.

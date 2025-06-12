@@ -1,0 +1,16 @@
+{
+  "include": [
+    "tsClient/src",
+    "tsapi/src"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    ".venv"
+  ],
+  "extraPaths": [
+    "tsapi/src"
+  ],
+  "venvPath": ".",
+  "venv": ".venv"
+}

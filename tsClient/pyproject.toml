@@ -4,15 +4,17 @@ version = "0.1.0"
 description = "TradeStation API client implementation"
 authors = ["Steve"]
 readme = "README.md"
-packages = [{ include = "src"}]
+package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.9.1,<4.0"
 requests = "^2.31.0"
+httpx = "^0.27.0"
+tsapi = {path = "C:/Users/steve/OneDrive/Trading/ts-trades/tsapi", develop = true}
 
 [tool.poetry.group.dev.dependencies]
-# For now, we'll handle tsAPI imports via sys.path manipulation
-# Once we restructure tsAPI properly, we can add it as a dependency
+# Add tsapi as an editable install for development
+tsapi = { path = "../tsapi", develop = true }
 
 [build-system]
 requires = ["poetry-core"]
